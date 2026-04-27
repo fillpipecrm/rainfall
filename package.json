@@ -1,0 +1,27 @@
+{
+  "name": "rainfall-go-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Migration-ready web app scaffold for the legacy Rainfall Solutions FileMaker database.",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "build:netlify": "node scripts/build-netlify.js",
+    "check": "node --check src/server.js && node --check scripts/import-filemaker-exports.js && node --check scripts/import-estimating-workbook.js && node --check scripts/build-netlify.js && node --check netlify/functions/app.js",
+    "pg:start": "./scripts/start-postgres.sh",
+    "pg:stop": "./scripts/stop-postgres.sh",
+    "db:schema": "./scripts/psql.sh \"${DATABASE_URL:-postgresql://briandavidson@localhost:5432/rainfall_go}\" -f db/schema.sql",
+    "db:seed": "./scripts/psql.sh \"${DATABASE_URL:-postgresql://briandavidson@localhost:5432/rainfall_go}\" -f db/seed.sql",
+    "import:csv": "node scripts/import-filemaker-exports.js",
+    "import:workbook": "node scripts/import-estimating-workbook.js"
+  },
+  "dependencies": {
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "serverless-http": "^4.0.0",
+    "xlsx": "^0.18.5"
+  }
+}
