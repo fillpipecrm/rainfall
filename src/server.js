@@ -1,13 +1,14 @@
 import express from "express";
-import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 import { config } from "./config.js";
 import { pool } from "./db/pool.js";
 
 const app = express();
-const modulePath = fileURLToPath(import.meta.url);
 
-app.use("/public", express.static(new URL("../public", import.meta.url).pathname));
+if (process.env.NETLIFY !== "true") {
+  app.use("/public", express.static(path.resolve(process.cwd(), "public")));
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -945,7 +946,7 @@ app.get("/assets", async (_request, response) => {
 
 export { app };
 
-if (process.argv[1] === modulePath) {
+if (process.env.NETLIFY !== "true") {
   app.listen(config.port, () => {
     console.log(`Rainfall Go Web listening on http://localhost:${config.port}`);
   });
