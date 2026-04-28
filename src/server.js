@@ -8,6 +8,7 @@ import {
   controllerGroups,
   defaultEstimateInput,
   largeRotorOptions,
+  optionsWithWorkbookRates,
   parseEstimateInput,
   rainBirdRotorOptions,
   rotorOptions,
@@ -257,10 +258,15 @@ async function loadLatestWorkbookContext() {
     ),
     query(
       `
-        select label, numeric_value
+        select
+          factor_group,
+          factor_key,
+          label,
+          numeric_value,
+          text_value,
+          payload
         from estimating_factors
         where workbook_id = $1
-          and factor_group = 'background_metrics'
         order by sort_order asc
       `,
       [latestWorkbook.id],
@@ -276,8 +282,13 @@ async function loadLatestWorkbookContext() {
     importedAt: latestWorkbook.imported_at,
     inventoryRows: inventoryRows.rows,
     noteTemplates: noteTemplates.rows,
+    estimatingFactors: factorRows.rows,
     defaults: {
-      laborRate: findFactorValue(factorRows.rows, /labor rate/i, 70),
+      laborRate: findFactorValue(
+        factorRows.rows.filter((row) => row.factor_group === "background_metrics"),
+        /labor rate/i,
+        70,
+      ),
     },
   };
 }
@@ -391,6 +402,10 @@ function renderEstimateBuilderPage({
   estimate = null,
   savedEstimateId = null,
 }) {
+  const ratedSprayOptions = optionsWithWorkbookRates(sprayOptions, workbook);
+  const ratedRotorOptions = optionsWithWorkbookRates(rotorOptions, workbook);
+  const ratedLargeRotorOptions = optionsWithWorkbookRates(largeRotorOptions, workbook);
+  const ratedRainBirdRotorOptions = optionsWithWorkbookRates(rainBirdRotorOptions, workbook);
   const controllerMarkup = controllerGroups
     .map((group) => renderControllerGroup(group, input.controllers[group.key] ?? {}))
     .join("");
@@ -447,6 +462,27 @@ function renderEstimateBuilderPage({
             metricValue(estimate.derived.driplineTotalFeet),
           )}</strong></div>
           <div><span>Labor hours</span><strong>${escapeHtml(metricValue(estimate.summary.laborHours))}</strong></div>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Formula parity audit</h2>
+        <div class="summary-list">
+          <div><span>Workbook nozzle rates</span><strong>${escapeHtml(estimate.derived.formulaAudit.nozzleRatesFromWorkbook)}</strong></div>
+          <div><span>Workbook labor rates</span><strong>${escapeHtml(estimate.derived.formulaAudit.laborRatesFromWorkbook)}</strong></div>
+          <div><span>Inventory rows checked</span><strong>${escapeHtml(estimate.derived.formulaAudit.inventoryRows)}</strong></div>
+          <div><span>Priced line items</span><strong>${escapeHtml(estimate.derived.formulaAudit.pricedLineItems)}</strong></div>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Labor breakdown</h2>
+        <div class="summary-list">
+          ${Object.entries(estimate.derived.laborComponents)
+            .map(
+              ([key, value]) => `
+                <div><span>${escapeHtml(key.replaceAll(/([A-Z])/g, " $1").toLowerCase())}</span><strong>${escapeHtml(metricValue(value))}</strong></div>
+              `,
+            )
+            .join("")}
         </div>
       </section>
       <section class="panel panel-wide">
@@ -519,6 +555,10 @@ function renderEstimateBuilderPage({
         label: countLabel(workbook.inventoryRows.length, "inventory row"),
       },
       {
+        value: workbook.estimatingFactors.length,
+        label: countLabel(workbook.estimatingFactors.length, "factor"),
+      },
+      {
         value: recentEstimates.length,
         label: countLabel(recentEstimates.length, "saved estimate"),
       },
@@ -570,10 +610,10 @@ function renderEstimateBuilderPage({
           </div>
 
           <div class="content-grid builder-sections">
-            ${renderOptionTable({ title: "Spray heads", prefix: "spray", options: sprayOptions, values: input.spray })}
-            ${renderOptionTable({ title: "MP rotors", prefix: "rotor", options: rotorOptions, values: input.rotor })}
-            ${renderOptionTable({ title: "Large rotors", prefix: "large_rotor", options: largeRotorOptions, values: input.largeRotor })}
-            ${renderOptionTable({ title: "Rain Bird rotors", prefix: "rainbird_rotor", options: rainBirdRotorOptions, values: input.rainBirdRotor })}
+            ${renderOptionTable({ title: "Spray heads", prefix: "spray", options: ratedSprayOptions, values: input.spray })}
+            ${renderOptionTable({ title: "MP rotors", prefix: "rotor", options: ratedRotorOptions, values: input.rotor })}
+            ${renderOptionTable({ title: "Large rotors", prefix: "large_rotor", options: ratedLargeRotorOptions, values: input.largeRotor })}
+            ${renderOptionTable({ title: "Rain Bird rotors", prefix: "rainbird_rotor", options: ratedRainBirdRotorOptions, values: input.rainBirdRotor })}
 
             <section class="panel">
               <h2>Backflow devices</h2>

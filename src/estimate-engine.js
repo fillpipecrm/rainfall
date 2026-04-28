@@ -1,4 +1,5 @@
 const toKey = (value) => value.replaceAll(/[^a-zA-Z0-9]+/g, "_");
+const normalizeLabel = (value) => String(value ?? "").replaceAll(/\s+/g, " ").trim().toLowerCase();
 
 export const sprayOptions = [
   ["8Q", 0.18],
@@ -331,26 +332,68 @@ function roundMoney(value) {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
+function workbookFactors(workbook, group) {
+  return (workbook.estimatingFactors ?? []).filter((factor) => factor.factor_group === group);
+}
+
+function workbookFactorMatch(workbook, group, pattern) {
+  return workbookFactors(workbook, group).find(
+    (factor) =>
+      factor.numeric_value !== null &&
+      factor.numeric_value !== undefined &&
+      pattern.test(factor.label ?? ""),
+  );
+}
+
+function workbookFactorValue(workbook, group, pattern, fallback) {
+  const match = workbookFactorMatch(workbook, group, pattern);
+
+  return match ? Number(match.numeric_value) : fallback;
+}
+
+function workbookNozzleRate(workbook, label, fallback) {
+  const normalized = normalizeLabel(label);
+  const match = workbookFactors(workbook, "nozzle_rates").find(
+    (factor) =>
+      factor.numeric_value !== null &&
+      factor.numeric_value !== undefined &&
+      normalizeLabel(factor.label) === normalized,
+  );
+
+  return match ? Number(match.numeric_value) : fallback;
+}
+
+export function optionsWithWorkbookRates(options, workbook) {
+  return options.map((option) => ({
+    ...option,
+    gpm: workbookNozzleRate(workbook, option.label, option.gpm),
+  }));
+}
+
 function quantityFor(input, workbook) {
   const quantities = {};
   const controller = (groupKey, slotKey) => input.controllers[groupKey]?.[slotKey] ?? 0;
+  const ratedSprayOptions = optionsWithWorkbookRates(sprayOptions, workbook);
+  const ratedRotorOptions = optionsWithWorkbookRates(rotorOptions, workbook);
+  const ratedLargeRotorOptions = optionsWithWorkbookRates(largeRotorOptions, workbook);
+  const ratedRainBirdRotorOptions = optionsWithWorkbookRates(rainBirdRotorOptions, workbook);
   const sprayTotal = sumValues(input.spray);
-  const sprayGpm = sprayOptions.reduce(
+  const sprayGpm = ratedSprayOptions.reduce(
     (sum, option) => sum + input.spray[option.key] * option.gpm,
     0,
   );
   const mpRotorTotal = sumValues(input.rotor);
-  const mpRotorGpm = rotorOptions.reduce(
+  const mpRotorGpm = ratedRotorOptions.reduce(
     (sum, option) => sum + input.rotor[option.key] * option.gpm,
     0,
   );
   const largeRotorTotal = sumValues(input.largeRotor);
-  const largeRotorGpm = largeRotorOptions.reduce(
+  const largeRotorGpm = ratedLargeRotorOptions.reduce(
     (sum, option) => sum + input.largeRotor[option.key] * option.gpm,
     0,
   );
   const rainBirdTotal = sumValues(input.rainBirdRotor);
-  const rainBirdGpm = rainBirdRotorOptions.reduce(
+  const rainBirdGpm = ratedRainBirdRotorOptions.reduce(
     (sum, option) => sum + input.rainBirdRotor[option.key] * option.gpm,
     0,
   );
@@ -426,7 +469,7 @@ function quantityFor(input, workbook) {
 
   quantities[4] = rainBirdTotal;
   quantities[5] = Math.max(largeRotorTotal - input.largeRotorTall, 0);
-  quantities[6] = quantities[5];
+  quantities[6] = input.largeRotorTall;
   quantities[7] = Math.max(
     sprayTotal + mpRotorTotal - input.spray12Tall - input.stream12Tall - input.spray6Tall - input.stream6Tall,
     0,
@@ -609,30 +652,74 @@ function quantityFor(input, workbook) {
     .filter((item) => item.quantity > 0);
 
   const materialsSubtotal = lineItems.reduce((sum, item) => sum + item.lineTotal, 0);
-  const laborHours =
-    Math.max(sprayTotal - input.spray12Tall - input.spray6Tall, 0) * 0.5 +
-    input.spray6Tall * 0.6 +
-    input.spray12Tall * 0.8 +
-    Math.max(mpRotorTotal - input.stream12Tall - input.stream6Tall, 0) * 0.6 +
-    input.stream6Tall * 0.6 +
-    input.stream12Tall * 0.8 +
-    totalRotorCount * 0.6 +
-    input.largeRotorTall * 1 +
-    (input.dripLengths.level1 / 100) * 1 +
-    (input.dripLengths.level2 / 100) * 1.2 +
-    (input.dripLengths.level3 / 100) * 1.4 +
-    (input.dripLengths.level4 / 100) * 0.1 +
-    driplineAreaFeet / 100 +
-    input.treeRingCount * 0.5 +
-    totalZones * 1 +
-    smallControllerBaseCount * 0.5 +
-    largeControllerBaseCount * 1 +
-    totalZones * 0.2 +
-    input.mainlineFeet.one * 0.02 +
-    input.mainlineFeet.oneQuarter * 0.025 +
-    input.mainlineFeet.oneHalf * 0.03 +
-    input.yardFaucetCount * 1 +
-    input.additionalLaborHours;
+  let laborRatesFromWorkbook = 0;
+  const laborRate = (pattern, fallback) => {
+    const match = workbookFactorMatch(workbook, "background_metrics", pattern);
+
+    if (match) {
+      laborRatesFromWorkbook += 1;
+      return Number(match.numeric_value);
+    }
+
+    return fallback;
+  };
+  const laborRates = {
+    spray4: laborRate(/4"\s*Spray Heads/i, 0.5),
+    spray6: laborRate(/6"\s*Spray Heads/i, 0.6),
+    spray12: laborRate(/12"\s*Spray Heads/i, 0.8),
+    stream4: laborRate(/4"\s*Stream Rotor/i, 0.6),
+    stream6: laborRate(/6"\s*Stream Rotor/i, 0.6),
+    stream12: laborRate(/12"\s*Stream Rotor/i, 0.8),
+    miniRotary: laborRate(/5".*Mini Rotary Sprinklers/i, 0.6),
+    rotary12: laborRate(/12"\s*Rotary Sprinklers/i, 1),
+    drip1: laborRate(/Dripline 1 per 100'/i, 1),
+    drip2: laborRate(/Dripline 2 per 100'/i, 1.2),
+    drip3: laborRate(/Dripline 3 per 100'/i, 1.4),
+    drip4: laborRate(/Dripline 4 per 100'/i, 0.1),
+    treeRing: laborRate(/Dripline per Tree Ring/i, 0.5),
+    zoneValve: laborRate(/1"\s*zone valves/i, 1),
+    smallControllerBase: laborRate(/Small Controllerbase/i, 0.5),
+    largeControllerBase: laborRate(/Large Controller Base/i, 1),
+    controllerPerZone: laborRate(/Controller, per zone/i, 0.2),
+    mainlineOne: laborRate(/1"\s*Mainline.*ft/i, 0.02),
+    mainlineOneQuarter: laborRate(/1 1\/4"\s*Mainline.*ft/i, 0.025),
+    mainlineOneHalf: laborRate(/1 1\/2"\s*Mainline.*ft/i, 0.03),
+    yardFaucet: laborRate(/Install Yard Faucets/i, 1),
+  };
+  const spray4Count = Math.max(sprayTotal - input.spray12Tall - input.spray6Tall, 0);
+  const stream4Count = Math.max(mpRotorTotal - input.stream12Tall - input.stream6Tall, 0);
+  const miniRotaryCount = Math.max(largeRotorTotal - input.largeRotorTall, 0) + rainBirdTotal;
+  const laborComponents = {
+    sprayHeads:
+      spray4Count * laborRates.spray4 +
+      input.spray6Tall * laborRates.spray6 +
+      input.spray12Tall * laborRates.spray12,
+    streamRotors:
+      stream4Count * laborRates.stream4 +
+      input.stream6Tall * laborRates.stream6 +
+      input.stream12Tall * laborRates.stream12,
+    rotarySprinklers:
+      miniRotaryCount * laborRates.miniRotary + input.largeRotorTall * laborRates.rotary12,
+    dripline:
+      (input.dripLengths.level1 / 100) * laborRates.drip1 +
+      (input.dripLengths.level2 / 100) * laborRates.drip2 +
+      (input.dripLengths.level3 / 100) * laborRates.drip3 +
+      (input.dripLengths.level4 / 100) * laborRates.drip4 +
+      driplineAreaFeet / 100 +
+      input.treeRingCount * laborRates.treeRing,
+    valvesAndControllers:
+      totalZones * laborRates.zoneValve +
+      smallControllerBaseCount * laborRates.smallControllerBase +
+      largeControllerBaseCount * laborRates.largeControllerBase +
+      totalZones * laborRates.controllerPerZone,
+    mainline:
+      input.mainlineFeet.one * laborRates.mainlineOne +
+      input.mainlineFeet.oneQuarter * laborRates.mainlineOneQuarter +
+      input.mainlineFeet.oneHalf * laborRates.mainlineOneHalf,
+    yardFaucets: input.yardFaucetCount * laborRates.yardFaucet,
+    additional: input.additionalLaborHours,
+  };
+  const laborHours = Object.values(laborComponents).reduce((sum, value) => sum + value, 0);
   const laborCost = roundMoney(laborHours * input.laborRate);
   const tax = roundMoney(materialsSubtotal * input.taxRate);
   const subcontractors = roundMoney((input.electricianFee + input.plumberFee) / 0.9);
@@ -661,6 +748,17 @@ function quantityFor(input, workbook) {
       driplineTotalFeet: roundMoney(driplineTotalFeet),
       driplineAreaFeet: roundMoney(driplineAreaFeet),
       decoderDrivenControllers,
+      laborComponents: Object.fromEntries(
+        Object.entries(laborComponents).map(([key, value]) => [key, roundMoney(value)]),
+      ),
+      formulaAudit: {
+        inventoryRows: workbook.inventoryRows.length,
+        pricedLineItems: lineItems.length,
+        nozzleRatesFromWorkbook: workbookFactors(workbook, "nozzle_rates").filter(
+          (factor) => factor.numeric_value !== null && factor.numeric_value !== undefined,
+        ).length,
+        laborRatesFromWorkbook,
+      },
     },
     summary: {
       materialsSubtotal: roundMoney(materialsSubtotal),
