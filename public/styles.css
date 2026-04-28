@@ -221,7 +221,10 @@ h1 {
 }
 
 .search-form input,
-.search-form button {
+.search-form button,
+.field input,
+.table-input,
+.builder-form button {
   border-radius: 14px;
   border: 1px solid rgba(47, 69, 48, 0.14);
   padding: 12px 14px;
@@ -233,11 +236,88 @@ h1 {
   background: rgba(255, 255, 255, 0.74);
 }
 
-.search-form button {
+.search-form button,
+.builder-form button {
   background: var(--accent);
   color: white;
   border-color: transparent;
   cursor: pointer;
+}
+
+.builder-form {
+  display: grid;
+  gap: 22px;
+  margin-top: 18px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+}
+
+.compact-grid {
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+}
+
+.field span {
+  color: var(--muted);
+  font-size: 0.88rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.field input,
+.table-input {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.74);
+}
+
+.builder-sections {
+  align-items: start;
+}
+
+.table-input-cell {
+  width: 110px;
+}
+
+.table-input {
+  text-align: right;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.summary-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.summary-list div {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.summary-list span {
+  color: var(--muted);
+}
+
+.notice-panel {
+  border-color: rgba(47, 111, 80, 0.28);
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.74), rgba(229, 244, 234, 0.86)),
+    var(--panel);
 }
 
 table {

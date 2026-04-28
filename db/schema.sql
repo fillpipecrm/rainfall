@@ -215,6 +215,39 @@ create table if not exists proposal_note_templates (
   created_at timestamptz not null default now()
 );
 
+create table if not exists estimate_runs (
+  id uuid primary key default gen_random_uuid(),
+  workbook_id uuid references estimate_workbooks(id) on delete set null,
+  proposal_number text,
+  title text not null,
+  status text not null default 'draft',
+  customer_name text,
+  address_1 text,
+  city text,
+  state text,
+  postal_code text,
+  phone text,
+  email text,
+  input_snapshot jsonb not null default '{}'::jsonb,
+  derived_snapshot jsonb not null default '{}'::jsonb,
+  summary_snapshot jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists estimate_run_items (
+  id uuid primary key default gen_random_uuid(),
+  estimate_run_id uuid not null references estimate_runs(id) on delete cascade,
+  row_number integer,
+  category text,
+  sku text,
+  description text not null,
+  quantity numeric(12, 2),
+  unit_price numeric(12, 2),
+  line_total numeric(12, 2),
+  created_at timestamptz not null default now()
+);
+
 create table if not exists import_rows (
   id bigint generated always as identity primary key,
   import_id uuid not null references imports(id) on delete cascade,
@@ -241,4 +274,10 @@ create index if not exists client_field_templates_workbook_id_idx
   on client_field_templates (workbook_id);
 create index if not exists proposal_note_templates_workbook_id_idx
   on proposal_note_templates (workbook_id);
+create index if not exists estimate_runs_workbook_id_idx
+  on estimate_runs (workbook_id);
+create index if not exists estimate_runs_created_at_idx
+  on estimate_runs (created_at desc);
+create index if not exists estimate_run_items_estimate_run_id_idx
+  on estimate_run_items (estimate_run_id);
 create index if not exists import_rows_import_id_idx on import_rows (import_id);

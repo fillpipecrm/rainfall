@@ -3,8 +3,20 @@ import path from "node:path";
 
 import { config } from "./config.js";
 import { pool } from "./db/pool.js";
+import {
+  calculateEstimate,
+  controllerGroups,
+  defaultEstimateInput,
+  largeRotorOptions,
+  parseEstimateInput,
+  rainBirdRotorOptions,
+  rotorOptions,
+  sprayOptions,
+} from "./estimate-engine.js";
 
 const app = express();
+
+app.use(express.urlencoded({ extended: true }));
 
 if (process.env.NETLIFY !== "true") {
   app.use("/public", express.static(path.resolve(process.cwd(), "public")));
@@ -76,6 +88,7 @@ function renderPage({ title, eyebrow, intro, stats = [], content }) {
         <header class="hero">
           <nav class="top-nav">
             <a href="/">Dashboard</a>
+            <a href="/builder">Builder</a>
             <a href="/estimating">Estimating</a>
             <a href="/inventory">Inventory</a>
             <a href="/customers">Customers</a>
@@ -128,6 +141,489 @@ npm run dev</code></pre>
       <section class="panel">
         <h2>Connection error</h2>
         <pre><code>${escapeHtml(describeError(error))}</code></pre>
+      </section>
+    `,
+  });
+}
+
+function inputValue(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  return escapeHtml(String(value));
+}
+
+function metricValue(value, digits = 2) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "n/a";
+  }
+
+  return Number(value).toFixed(digits).replace(/\.00$/, "");
+}
+
+function renderField({
+  label,
+  name,
+  value,
+  type = "text",
+  step,
+  min,
+  placeholder = "",
+}) {
+  const attributes = [
+    `type="${type}"`,
+    `name="${name}"`,
+    `value="${inputValue(value)}"`,
+    step !== undefined ? `step="${step}"` : "",
+    min !== undefined ? `min="${min}"` : "",
+    placeholder ? `placeholder="${escapeHtml(placeholder)}"` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return `
+    <label class="field">
+      <span>${escapeHtml(label)}</span>
+      <input ${attributes} />
+    </label>
+  `;
+}
+
+function renderWorkbookRequiredPage() {
+  return renderPage({
+    title: "Estimate builder",
+    eyebrow: "Workbook import required",
+    intro:
+      "The builder depends on the imported 2025 estimating workbook so inventory and note logic come from the real spreadsheet structure.",
+    content: `
+      <section class="panel panel-wide">
+        <pre><code>npm run import:workbook -- --file "/Users/briandavidson/Downloads/Irrigation Estimating Data Form revised 10-16-2025.xlsm"</code></pre>
+      </section>
+    `,
+  });
+}
+
+function findFactorValue(factors, pattern, fallback) {
+  const match = factors.find(
+    (row) => row.numeric_value !== null && row.numeric_value !== undefined && pattern.test(row.label ?? ""),
+  );
+  return match ? Number(match.numeric_value) : fallback;
+}
+
+async function loadLatestWorkbookContext() {
+  const latestWorkbookResult = await query(`
+    select
+      ew.id,
+      ew.file_name,
+      ew.workbook_type,
+      ew.version_label,
+      ew.workbook_title,
+      ew.imported_at
+    from estimate_workbooks ew
+    order by ew.imported_at desc
+    limit 1
+  `);
+
+  const latestWorkbook = latestWorkbookResult.rows[0] ?? null;
+
+  if (!latestWorkbook) {
+    return null;
+  }
+
+  const [inventoryRows, noteTemplates, factorRows] = await Promise.all([
+    query(
+      `
+        select
+          row_number,
+          category,
+          sku,
+          description,
+          unit_price
+        from inventory_snapshot_items
+        where workbook_id = $1
+        order by row_number asc
+      `,
+      [latestWorkbook.id],
+    ),
+    query(
+      `
+        select description, quantity, priority
+        from proposal_note_templates
+        where workbook_id = $1
+        order by sort_order asc
+      `,
+      [latestWorkbook.id],
+    ),
+    query(
+      `
+        select label, numeric_value
+        from estimating_factors
+        where workbook_id = $1
+          and factor_group = 'background_metrics'
+        order by sort_order asc
+      `,
+      [latestWorkbook.id],
+    ),
+  ]);
+
+  return {
+    workbookId: latestWorkbook.id,
+    fileName: latestWorkbook.file_name,
+    workbookType: latestWorkbook.workbook_type,
+    versionLabel: latestWorkbook.version_label,
+    workbookTitle: latestWorkbook.workbook_title,
+    importedAt: latestWorkbook.imported_at,
+    inventoryRows: inventoryRows.rows,
+    noteTemplates: noteTemplates.rows,
+    defaults: {
+      laborRate: findFactorValue(factorRows.rows, /labor rate/i, 70),
+    },
+  };
+}
+
+async function loadRecentEstimateRuns(limit = 8) {
+  const result = await query(
+    `
+      select
+        er.id,
+        er.title,
+        er.proposal_number,
+        er.customer_name,
+        er.status,
+        er.summary_snapshot ->> 'total' as total,
+        ew.file_name,
+        er.created_at
+      from estimate_runs er
+      left join estimate_workbooks ew on ew.id = er.workbook_id
+      order by er.created_at desc
+      limit $1
+    `,
+    [limit],
+  );
+
+  return result.rows;
+}
+
+function renderOptionTable({ title, prefix, options, values }) {
+  const rows = options
+    .map(
+      (option) => `
+        <tr>
+          <td>${escapeHtml(option.label)}</td>
+          <td class="numeric">${metricValue(option.gpm)}</td>
+          <td class="numeric table-input-cell">
+            <input
+              class="table-input"
+              type="number"
+              name="${escapeHtml(prefix)}_${escapeHtml(option.key)}"
+              min="0"
+              step="1"
+              value="${inputValue(values[option.key] ?? 0)}"
+            />
+          </td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <section class="panel">
+      <h2>${escapeHtml(title)}</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Option</th>
+            <th class="numeric">GPM</th>
+            <th class="numeric">Qty</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </section>
+  `;
+}
+
+function renderControllerGroup(group, values) {
+  const rows = group.slots
+    .map(
+      (slot) => `
+        <tr>
+          <td>${escapeHtml(slot.label)}</td>
+          <td class="numeric table-input-cell">
+            <input
+              class="table-input"
+              type="number"
+              name="controller_${escapeHtml(group.key)}_${escapeHtml(slot.key)}"
+              min="0"
+              step="1"
+              value="${inputValue(values[slot.key] ?? 0)}"
+            />
+          </td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <article class="record-card">
+      <div class="record-topline">
+        <h2>${escapeHtml(group.label)}</h2>
+        <span class="pill subdued">${escapeHtml(countLabel(group.slots.length, "size"))}</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Station size</th>
+            <th class="numeric">Qty</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </article>
+  `;
+}
+
+function renderEstimateBuilderPage({
+  workbook,
+  input,
+  recentEstimates,
+  estimate = null,
+  savedEstimateId = null,
+}) {
+  const controllerMarkup = controllerGroups
+    .map((group) => renderControllerGroup(group, input.controllers[group.key] ?? {}))
+    .join("");
+  const recentEstimateMarkup = recentEstimates
+    .map(
+      (row) => `
+        <article class="record-card">
+          <div class="record-topline">
+            <h2>${escapeHtml(row.proposal_number || "Draft estimate")}</h2>
+            <span class="pill">${escapeHtml(row.status)}</span>
+          </div>
+          <p class="strong">${escapeHtml(row.title)}</p>
+          <p>${escapeHtml(row.customer_name || "No customer name saved")}</p>
+          <p class="meta">${escapeHtml(
+            new Date(row.created_at).toLocaleString("en-US"),
+          )}</p>
+          <p class="money">${currency(row.total)}</p>
+        </article>
+      `,
+    )
+    .join("");
+  const resultMarkup = estimate
+    ? `
+      <section class="panel panel-wide notice-panel">
+        <div class="panel-heading">
+          <h2>Estimate saved</h2>
+          <span class="pill">${escapeHtml(savedEstimateId ? savedEstimateId.slice(0, 8) : "draft")}</span>
+        </div>
+        <p>${escapeHtml(estimate.title)} totals ${currency(estimate.summary.total)} based on the latest imported workbook inventory.</p>
+      </section>
+      <section class="panel">
+        <h2>Summary</h2>
+        <div class="summary-list">
+          <div><span>Materials</span><strong>${currency(estimate.summary.materialsSubtotal)}</strong></div>
+          <div><span>Labor</span><strong>${currency(estimate.summary.laborCost)}</strong></div>
+          <div><span>Tax</span><strong>${currency(estimate.summary.tax)}</strong></div>
+          <div><span>Subcontractors</span><strong>${currency(estimate.summary.subcontractors)}</strong></div>
+          <div><span>Profit</span><strong>${currency(estimate.summary.profitAmount)}</strong></div>
+          <div><span>Total</span><strong>${currency(estimate.summary.total)}</strong></div>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Derived metrics</h2>
+        <div class="summary-list">
+          <div><span>Spray heads</span><strong>${escapeHtml(estimate.derived.sprayTotal)}</strong></div>
+          <div><span>Spray GPM</span><strong>${escapeHtml(metricValue(estimate.derived.sprayGpm))}</strong></div>
+          <div><span>Rotor count</span><strong>${escapeHtml(
+            estimate.derived.mpRotorTotal +
+              estimate.derived.largeRotorTotal +
+              estimate.derived.rainBirdTotal,
+          )}</strong></div>
+          <div><span>Total zones</span><strong>${escapeHtml(estimate.derived.totalZones)}</strong></div>
+          <div><span>Dripline feet</span><strong>${escapeHtml(
+            metricValue(estimate.derived.driplineTotalFeet),
+          )}</strong></div>
+          <div><span>Labor hours</span><strong>${escapeHtml(metricValue(estimate.summary.laborHours))}</strong></div>
+        </div>
+      </section>
+      <section class="panel panel-wide">
+        <h2>Calculated line items</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Row</th>
+              <th>Category</th>
+              <th>Part #</th>
+              <th>Description</th>
+              <th class="numeric">Qty</th>
+              <th class="numeric">Unit Price</th>
+              <th class="numeric">Line Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${estimate.lineItems
+              .map(
+                (item) => `
+                  <tr>
+                    <td>${escapeHtml(item.rowNumber)}</td>
+                    <td>${escapeHtml(item.category ?? "Uncategorized")}</td>
+                    <td>${escapeHtml(item.sku ?? "n/a")}</td>
+                    <td>${escapeHtml(item.description)}</td>
+                    <td class="numeric">${escapeHtml(metricValue(item.quantity))}</td>
+                    <td class="numeric">${currency(item.unitPrice)}</td>
+                    <td class="numeric">${currency(item.lineTotal)}</td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </section>
+      <section class="panel panel-wide">
+        <h2>Proposal notes carried from workbook</h2>
+        <div class="tag-grid">
+          ${estimate.noteTemplates.length
+            ? estimate.noteTemplates
+                .map(
+                  (note) => `
+                    <article class="record-card">
+                      <p class="strong">${escapeHtml(note.description)}</p>
+                      <p class="meta">Priority ${escapeHtml(note.priority ?? "n/a")} · Qty ${escapeHtml(
+                        note.quantity ?? "n/a",
+                      )}</p>
+                    </article>
+                  `,
+                )
+                .join("")
+            : "<p>No note templates matched this workbook.</p>"}
+        </div>
+      </section>
+    `
+    : "";
+
+  return renderPage({
+    title: "Estimate builder",
+    eyebrow: workbook.fileName,
+    intro:
+      "This is the first workbook-driven estimate flow: enter field quantities, map them through the imported inventory sheet, and save the result as a draft estimate in PostgreSQL.",
+    stats: [
+      {
+        value: workbook.versionLabel || "n/a",
+        label: "workbook version",
+      },
+      {
+        value: workbook.inventoryRows.length,
+        label: countLabel(workbook.inventoryRows.length, "inventory row"),
+      },
+      {
+        value: recentEstimates.length,
+        label: countLabel(recentEstimates.length, "saved estimate"),
+      },
+    ],
+    content: `
+      ${resultMarkup}
+      <section class="panel panel-wide">
+        <div class="panel-heading">
+          <h2>Project and pricing inputs</h2>
+          <span class="pill subdued">Labor default ${currency(workbook.defaults.laborRate)}</span>
+        </div>
+        <form method="post" class="builder-form">
+          <div class="form-grid">
+            ${renderField({ label: "Estimate title", name: "title", value: input.title, placeholder: "Maple Street retrofit" })}
+            ${renderField({ label: "Proposal number", name: "proposalNumber", value: input.proposalNumber, placeholder: "RG-26001" })}
+            ${renderField({ label: "Client name", name: "clientName", value: input.clientName })}
+            ${renderField({ label: "Address", name: "address1", value: input.address1 })}
+            ${renderField({ label: "City", name: "city", value: input.city })}
+            ${renderField({ label: "State", name: "state", value: input.state })}
+            ${renderField({ label: "Postal code", name: "postalCode", value: input.postalCode })}
+            ${renderField({ label: "Phone", name: "phone", value: input.phone })}
+            ${renderField({ label: "Email", name: "email", value: input.email, type: "email" })}
+            ${renderField({ label: "Working GPM", name: "workingGpm", value: input.workingGpm, type: "number", min: 0, step: "0.1" })}
+            ${renderField({ label: "Labor rate", name: "laborRate", value: input.laborRate, type: "number", min: 0, step: "0.01" })}
+            ${renderField({ label: "Tax rate", name: "taxRate", value: input.taxRate, type: "number", min: 0, step: "0.0001" })}
+            ${renderField({ label: "Profit margin", name: "profitMargin", value: input.profitMargin, type: "number", min: 0, step: "0.0001" })}
+            ${renderField({ label: "Electrician fee", name: "electricianFee", value: input.electricianFee, type: "number", min: 0, step: "0.01" })}
+            ${renderField({ label: "Plumber fee", name: "plumberFee", value: input.plumberFee, type: "number", min: 0, step: "0.01" })}
+            ${renderField({ label: "Additional labor hours", name: "additionalLaborHours", value: input.additionalLaborHours, type: "number", min: 0, step: "0.1" })}
+            ${renderField({ label: "Drip area sq ft", name: "dripAreaSqFt", value: input.dripAreaSqFt, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Drip zones", name: "dripZoneCount", value: input.dripZoneCount, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Tree rings", name: "treeRingCount", value: input.treeRingCount, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "12 in spray heads", name: "spray12Tall", value: input.spray12Tall, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "6 in spray heads", name: "spray6Tall", value: input.spray6Tall, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "12 in stream rotors", name: "stream12Tall", value: input.stream12Tall, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "6 in stream rotors", name: "stream6Tall", value: input.stream6Tall, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Tall large rotors", name: "largeRotorTall", value: input.largeRotorTall, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Yard faucets", name: "yardFaucetCount", value: input.yardFaucetCount, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Rain switches", name: "rainSwitchCount", value: input.rainSwitchCount, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Filter assemblies", name: "filterRequiredCount", value: input.filterRequiredCount, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Booster pumps", name: "boosterPumpCount", value: input.boosterPumpCount, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Drip level 1 feet", name: "drip_level1", value: input.dripLengths.level1, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Drip level 2 feet", name: "drip_level2", value: input.dripLengths.level2, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Drip level 3 feet", name: "drip_level3", value: input.dripLengths.level3, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "Drip level 4 feet", name: "drip_level4", value: input.dripLengths.level4, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "1 in mainline feet", name: "mainline_one", value: input.mainlineFeet.one, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "1.25 in mainline feet", name: "mainline_one_quarter", value: input.mainlineFeet.oneQuarter, type: "number", min: 0, step: "1" })}
+            ${renderField({ label: "1.5 in mainline feet", name: "mainline_one_half", value: input.mainlineFeet.oneHalf, type: "number", min: 0, step: "1" })}
+          </div>
+
+          <div class="content-grid builder-sections">
+            ${renderOptionTable({ title: "Spray heads", prefix: "spray", options: sprayOptions, values: input.spray })}
+            ${renderOptionTable({ title: "MP rotors", prefix: "rotor", options: rotorOptions, values: input.rotor })}
+            ${renderOptionTable({ title: "Large rotors", prefix: "large_rotor", options: largeRotorOptions, values: input.largeRotor })}
+            ${renderOptionTable({ title: "Rain Bird rotors", prefix: "rainbird_rotor", options: rainBirdRotorOptions, values: input.rainBirdRotor })}
+
+            <section class="panel">
+              <h2>Backflow devices</h2>
+              <div class="form-grid compact-grid">
+                ${renderField({ label: '850 3/4"', name: "backflow_febco850_34", value: input.backflow.febco850_34, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: '850 1"', name: "backflow_febco850_1", value: input.backflow.febco850_1, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: '765 3/4"', name: "backflow_febco765_34", value: input.backflow.febco765_34, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: '765 1"', name: "backflow_febco765_1", value: input.backflow.febco765_1, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: '825 3/4"', name: "backflow_febco825_34", value: input.backflow.febco825_34, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: '825 1"', name: "backflow_febco825_1", value: input.backflow.febco825_1, type: "number", min: 0, step: "1" })}
+              </div>
+            </section>
+
+            <section class="panel">
+              <h2>Wire and decoders</h2>
+              <div class="form-grid compact-grid">
+                ${renderField({ label: "18/13 wire feet", name: "wire_wire18_13", value: input.wireFeet.wire18_13, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: "18/9 wire feet", name: "wire_wire18_9", value: input.wireFeet.wire18_9, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: "18/7 wire feet", name: "wire_wire18_7", value: input.wireFeet.wire18_7, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: "18/5 wire feet", name: "wire_wire18_5", value: input.wireFeet.wire18_5, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: "18/3 wire feet", name: "wire_wire18_3", value: input.wireFeet.wire18_3, type: "number", min: 0, step: "1" })}
+                ${renderField({ label: "Decoder wire feet", name: "wire_decoder", value: input.wireFeet.decoder, type: "number", min: 0, step: "1" })}
+              </div>
+            </section>
+
+            <section class="panel panel-wide">
+              <div class="panel-heading">
+                <h2>Controller counts</h2>
+                <span class="pill subdued">Workbook-driven inventory mapping</span>
+              </div>
+              <div class="cards-grid">
+                ${controllerMarkup}
+              </div>
+            </section>
+          </div>
+
+          <div class="form-actions">
+            <button type="submit">Calculate and save draft</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel panel-wide">
+        <div class="panel-heading">
+          <h2>Recent saved estimates</h2>
+          <span class="pill">${escapeHtml(workbook.workbookTitle || workbook.fileName)}</span>
+        </div>
+        <div class="cards-grid">
+          ${recentEstimateMarkup || "<p>No estimates have been saved yet.</p>"}
+        </div>
       </section>
     `,
   });
@@ -453,6 +949,155 @@ app.get("/proposals", async (request, response) => {
             ${proposalMarkup || "<p>No proposals found.</p>"}
           </section>
         `,
+      }),
+    );
+  } catch (error) {
+    response.status(503).send(failurePage(error));
+  }
+});
+
+app.get("/builder", async (_request, response) => {
+  try {
+    const workbook = await loadLatestWorkbookContext();
+
+    if (!workbook) {
+      response.send(renderWorkbookRequiredPage());
+      return;
+    }
+
+    const input = defaultEstimateInput();
+    input.laborRate = workbook.defaults.laborRate;
+
+    const recentEstimates = await loadRecentEstimateRuns();
+
+    response.send(
+      renderEstimateBuilderPage({
+        workbook,
+        input,
+        recentEstimates,
+      }),
+    );
+  } catch (error) {
+    response.status(503).send(failurePage(error));
+  }
+});
+
+app.post("/builder", async (request, response) => {
+  const input = parseEstimateInput(request.body);
+
+  try {
+    const workbook = await loadLatestWorkbookContext();
+
+    if (!workbook) {
+      response.send(renderWorkbookRequiredPage());
+      return;
+    }
+
+    const estimate = calculateEstimate(input, workbook);
+    const client = await pool.connect();
+    let savedEstimateId = null;
+
+    try {
+      await client.query("begin");
+
+      const estimateRunResult = await client.query(
+        `
+          insert into estimate_runs (
+            workbook_id,
+            proposal_number,
+            title,
+            customer_name,
+            address_1,
+            city,
+            state,
+            postal_code,
+            phone,
+            email,
+            input_snapshot,
+            derived_snapshot,
+            summary_snapshot
+          )
+          values (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            $8,
+            $9,
+            $10,
+            $11::jsonb,
+            $12::jsonb,
+            $13::jsonb
+          )
+          returning id
+        `,
+        [
+          workbook.workbookId,
+          estimate.proposalNumber || null,
+          estimate.title,
+          input.clientName || null,
+          input.address1 || null,
+          input.city || null,
+          input.state || null,
+          input.postalCode || null,
+          input.phone || null,
+          input.email || null,
+          JSON.stringify(input),
+          JSON.stringify(estimate.derived),
+          JSON.stringify(estimate.summary),
+        ],
+      );
+
+      savedEstimateId = estimateRunResult.rows[0].id;
+
+      for (const item of estimate.lineItems) {
+        await client.query(
+          `
+            insert into estimate_run_items (
+              estimate_run_id,
+              row_number,
+              category,
+              sku,
+              description,
+              quantity,
+              unit_price,
+              line_total
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8)
+          `,
+          [
+            savedEstimateId,
+            item.rowNumber,
+            item.category ?? null,
+            item.sku ?? null,
+            item.description,
+            item.quantity,
+            item.unitPrice,
+            item.lineTotal,
+          ],
+        );
+      }
+
+      await client.query("commit");
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    const recentEstimates = await loadRecentEstimateRuns();
+
+    response.send(
+      renderEstimateBuilderPage({
+        workbook,
+        input: { ...input, title: estimate.title },
+        recentEstimates,
+        estimate,
+        savedEstimateId,
       }),
     );
   } catch (error) {
